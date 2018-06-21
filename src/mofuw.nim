@@ -9,6 +9,7 @@ import
   logging,
   strtabs,
   strutils,
+  asyncfile,
   strformat,
   threadpool,
   asyncdispatch,
@@ -45,7 +46,7 @@ type
     ip*: string
     buf*: string
     bodyStart: int
-    bParams, params*, query*: StringTableRef
+    bodyParams, params*, query*: StringTableRef
     # this is for big request
     # TODO
     tmp*: cstring
@@ -63,10 +64,12 @@ const
   defaultMaxBodySize {.intdefine.} = 1 * mByte
   bufSize {.intdefine.} = 512
 
-var
-  cacheTables {.threadvar.}: TableRef[string, string]
-  callback    {.threadvar.}: Callback
-  maxBodySize {.threadvar.}: int
+  isDebug {.intdefine.} = if defined(release) or defined(safeRelease): 1 else: 0
+
+var cacheTables {.threadvar, deprecated.}: TableRef[string, string]
+var callback    {.threadvar.}: Callback
+var maxBodySize {.threadvar.}: int
+var errorLogFile {.threadvar.}, accessLogFile {.threadvar.}: AsyncFile
 
 proc countCPUs: int =
   when defined(linux):
@@ -124,14 +127,6 @@ proc newServerSocket(port: int = 8080, backlog: int = 128): SocketHandle =
 
   return server.getFd()
 
-proc hash(str: string): Hash =
-  var h = 0
-  
-  for v in str:
-    h = h !& v.int
-
-  result = !$h
-
 proc getMethod*(req: mofuwReq): string {.inline.} =
   result = getMethod(req.mhr)
 
@@ -147,13 +142,30 @@ proc getHeader*(req: mofuwReq, name: string): string {.inline.} =
 proc toHttpHeaders*(req: mofuwReq): HttpHeaders {.inline.} =
   result = req.mhr.toHttpHeaders()
 
-proc bodyParse*(req: mofuwReq): StringTableRef =
-  req.bodyParse
+proc setParam*(req: mofuwReq, params: StringTableRef) {.inline.} =
+  req.params = params
+
+proc setQuery*(req: mofuwReq, query: StringTableRef) {.inline.} =
+  req.query = query
+
+proc params*(req: mofuwReq, key: string): string =
+  if req.params.isNil: return nil
+  req.params.getOrDefault(key)
+
+proc query*(req: mofuwReq, key: string): string =
+  if req.query.isNil: return nil
+  req.query.getOrDefault(key)
 
 proc body*(req: mofuwReq, key: string = nil): string =
   if key.isNil: return $req.buf[req.bodyStart .. ^1]
-  if req.bParams.isNil: req.bParams = req.body.bodyParse
-  req.bParams.getOrDefault(key)
+  if req.bodyParams.isNil: req.bodyParams = req.body.bodyParse
+  req.bodyParams.getOrDefault(key)
+
+proc hash(str: string): Hash =
+  var h = 0
+  for v in str:
+    h = h !& v.int
+  result = !$h
 
 proc mofuwSend*(res: mofuwRes, body: string) {.async.} =
   var buf: string
@@ -171,10 +183,19 @@ proc mofuwSend*(res: mofuwRes, body: string) {.async.} =
       # TODO send error logging
       discard
 
-proc notFound*(res: mofuwRes) {.async.} =
-  await mofuwSend(res, notFound())
+template mofuwResp*(status, mime, body: string): typed =
+  asyncCheck res.mofuwSend(makeResp(
+    status,
+    mime,
+    body))
 
-proc cacheResp*(res: mofuwRes, path, status, mime, body: string) {.async.} =
+template mofuwOK*(body: string, mime: string = "text/plain") =
+  mofuwResp(
+    HTTP200,
+    mime,
+    body)
+
+proc cacheResp*(res: mofuwRes, path, status, mime, body: string) {.async, deprecated.} =
   if cacheTables.hasKey(path):
     asyncCheck res.mofuwSend(cacheTables[path])
     return
@@ -199,11 +220,14 @@ proc cacheResp*(res: mofuwRes, path, status, mime, body: string) {.async.} =
 
     addTimer(1000, false, cacheCB)
 
+proc notFound*(res: mofuwRes) {.async.} =
+  await mofuwSend(res, notFound())
+
 proc badGateway: string =
   result = makeResp(
     HTTP502,
     "text/html",
-    "<html><h1>" & HTTP502[13..^2] & "</h1>")
+    "<html><h1>502 Bad Gateway</h1>")
 
 proc nowDateTime: (string, string) =
   var ti = now()
@@ -441,19 +465,16 @@ proc mofuwRun*(cb: Callback,
   if cb == nil:
     raise newException(Exception, "callback is nil.")
 
+  if isDebug.bool:
+    errorLogFile = openAsync("error.log")
+    accessLogFile = openAsync("access.log")
+
   cacheTables = newTable[string, string]()
 
   for i in 0 ..< countCPUs():
     spawn run(port, backlog, maxBodySize, cb, cacheTables)
 
   sync()
-
-template mofuwResp*(status, mime, body: string): typed =
-  asyncCheck res.mofuwSend(makeResp(
-    status,
-    mime,
-    body
-  ))
 
 macro routes*(body: untyped): typed =
   result = newStmtList()

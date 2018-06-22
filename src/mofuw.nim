@@ -18,7 +18,7 @@ import
 from httpcore import HttpHeaders
 
 when defined(windows):
-  from winlean import TCP_NODELAY
+  from winlean import TCP_NODELAY, WSAEWOULDBLOCK
 else:
   from posix import TCP_NODELAY, EAGAIN, EWOULDBLOCK
 
@@ -46,7 +46,7 @@ type
     ip*: string
     buf*: string
     bodyStart: int
-    bodyParams, params*, query*: StringTableRef
+    bodyParams, params, query: StringTableRef
     # this is for big request
     # TODO
     tmp*: cstring
@@ -255,176 +255,94 @@ proc serverError*(res: mofuwRes): string =
 
 proc handler(fd: AsyncFD, ip: string) {.async.} =
   var
-    request = mofuwReq(ip: ip, buf: "", mhr: MPHTTPReq())
+    request = mofuwReq(buf: "", mhr: MPHTTPReq())
     response = mofuwRes(fd: fd)
+    r: int
+    buf: array[bufSize, char]
 
-  when defined(windows):
-    block handler:
-      while true:
-        # on Windows, need linecheck.
-        # because Windows is shitty.
-        # TODO recvLine is deprecated.
-        let recv = await recvLine(fd)
-        if recv == "":
-          try:
-            closeSocket(fd)
-          except:
-            discard
-          finally:
-            break
-        else:
-          # if request is big, return bodyTooLarge
-          if recv.len > bufSize:
-            await response.mofuwSend(bodyTooLarge())
-            closeSocket(fd)
-            break handler
-          request.buf.add(recv)
-          if not(recv == "\c\L"):
-            # add \c\L
-            # because not added \c\L request.buf.add(recv)
-            request.buf.add("\c\L")
-            continue
+  block handler:
+    while true:
+      # using our buffer
+      r = await recvInto(fd, addr buf[0], bufSize)
+      if r == 0:
+        try:
+          closeSocket(fd)
+        except:
+          discard
+        finally:
+          break 
+      else:
+        let ol = request.buf.len
+        request.buf.setLen(ol+r)
+        for i in 0 ..< r: request.buf[ol+i] = buf[i]
 
-          let r = mpParseRequest(addr request.buf[0], request.mhr)
-
-          if r <= 0:
-            await response.mofuwSend(notFound())
-            closeSocket(fd)
-            break handler
-          
-          let cl = request.getHeader("Content-Length")
-          # if have Content-Length, try recv body.
-          # TODO recv body timeout
-          if not(cl == ""):
-            if cl.parseInt > maxBodySize:
-              await response.mofuwSend(bodyTooLarge())
+        if r == bufSize:
+          while true:
+            let r = fd.SocketHandle.recv(addr buf[0], bufSize, 0)
+            case r
+            of 0:
+              await response.mofuwSend(badRequest())
               closeSocket(fd)
               break handler
-            let r = await recv(fd, cl.parseInt)
-            request.buf.add(r)
-
-          request.bodyStart = r
-
-          try:
-            await callback(request, response)
-          except:
-            # erro check.
-            let fut = response.mofuwSend(badGateway())
-            fut.callback = proc() =
-              closeSocket(fd)
-            break handler
-
-          # for pipeline ?
-          var
-            isGETorHEAD = (request.getMethod == "GET") or (request.getMethod == "HEAD")
-            remainingBufferSize = request.buf.len - request.bodyStart - 1
-
-          while true:
-            if unlikely(isGETorHEAD and (remainingBufferSize > 0)):
-              request.buf.delete(0, request.bodyStart)
-              let r = mpParseRequest(addr request.buf[0], request.mhr)
-
-              if r <= 0:
-                await response.mofuwSend(notFound())
-                closeSocket(fd)
-                break handler
-
-              request.bodyStart = r
-              try:
-                await callback(request, response)
-              except:
-                # erro check.
-                let fut = response.mofuwSend(badGateway())
-                fut.callback = proc() =
-                  closeSocket(fd)
-                break handler
-              remainingBufferSize = request.buf.len - request.bodyStart - 1
-            else:
-              break
-
-  else:
-    var
-      r: int
-      buf: array[bufSize, char]
-
-    block handler:
-      while true:
-        # using our buffer
-        r = await recvInto(fd, addr buf[0], bufSize)
-        if r == 0:
-          try:
-            closeSocket(fd)
-          except:
-            discard
-          finally:
-            break 
-        else:
-          let ol = request.buf.len
-          request.buf.setLen(ol+r)
-          for i in 0 ..< r: request.buf[ol+i] = buf[i]
-
-          if r == bufSize:
-            while true:
-              let r = fd.SocketHandle.recv(addr buf[0], bufSize, 0)
-              case r
-              of 0:
-                await response.mofuwSend(badRequest())
-                closeSocket(fd)
-                break handler
-              of -1:
-                if osLastError().int in {EAGAIN, EWOULDBLOCK}: break
-                await response.mofuwSend(badRequest())
-                closeSocket(fd)
-                break handler
+            of -1:
+              when defined(windows):
+                if osLastError().int in {WSAEWOULDBLOCK}: break
               else:
-                let ol = request.buf.len
-                request.buf.setLen(ol+r)
-                for i in 0 ..< r: request.buf[ol+i] = buf[i]
-
-          let r = mpParseRequest(addr request.buf[0], request.mhr)
-
-          if r <= 0:
-            await response.mofuwSend(badRequest())
-            closeSocket(fd)
-            break handler
-
-          var isGETorHEAD = (request.getMethod == "GET") or (request.getMethod == "HEAD")
-
-          if unlikely((request.buf.len > maxBodySize) and isGETorHEAD):
-            await response.mofuwSend(bodyTooLarge())
-            closeSocket(fd)
-            break handler
-
-          request.bodyStart = r
-
-          try:
-            await callback(request, response)
-          except:
-            # erro check.
-            discard
-
-          # for pipeline ?
-          var remainingBufferSize = request.buf.len - request.bodyStart - 1
-
-          while true:
-            if unlikely(isGETorHEAD and (remainingBufferSize > 0)):
-              request.buf.delete(0, request.bodyStart)
-              let r = mpParseRequest(addr request.buf[0], request.mhr)
-
-              if r <= 0:
-                await response.mofuwSend(badRequest())
-                closeSocket(fd)
-                break handler
-
-              request.bodyStart = r
-              try:
-                await callback(request, response)
-              except:
-                # erro check.
-                discard
-              remainingBufferSize = request.buf.len - request.bodyStart - 1
+                if osLastError().int in {EAGAIN, EWOULDBLOCK}: break
+              await response.mofuwSend(badRequest())
+              closeSocket(fd)
+              break handler
             else:
-              break
+              let ol = request.buf.len
+              request.buf.setLen(ol+r)
+              for i in 0 ..< r: request.buf[ol+i] = buf[i]
+
+        let r = mpParseRequest(addr request.buf[0], request.mhr)
+
+        if r <= 0:
+          await response.mofuwSend(badRequest())
+          closeSocket(fd)
+          break handler
+
+        var isGETorHEAD = (request.getMethod == "GET") or (request.getMethod == "HEAD")
+
+        if unlikely((request.buf.len > maxBodySize) and (not isGETorHEAD)):
+          await response.mofuwSend(bodyTooLarge())
+          closeSocket(fd)
+          break handler
+
+        request.bodyStart = r
+
+        try:
+          await callback(request, response)
+        except:
+          # erro check.
+          asyncCheck response.mofuwSend(badGateway())
+          break handler
+
+        # for pipeline ?
+        var remainingBufferSize = request.buf.len - request.bodyStart - 1
+
+        while true:
+          if unlikely(isGETorHEAD and (remainingBufferSize > 0)):
+            request.buf.delete(0, request.bodyStart)
+            let r = mpParseRequest(addr request.buf[0], request.mhr)
+
+            if r <= 0:
+              await response.mofuwSend(badRequest())
+              closeSocket(fd)
+              break handler
+
+            request.bodyStart = r
+            try:
+              await callback(request, response)
+            except:
+              # erro check.
+              asyncCheck response.mofuwSend(badGateway())
+              break handler
+            remainingBufferSize = request.buf.len - request.bodyStart - 1
+          else:
+            break
 
 proc updateTime(fd: AsyncFD): bool =
   updateServerTime()

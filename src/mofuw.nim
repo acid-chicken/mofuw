@@ -226,8 +226,8 @@ proc notFound*(res: mofuwRes) {.async.} =
 proc badGateway: string =
   result = makeResp(
     HTTP502,
-    "text/html",
-    "<html><h1>502 Bad Gateway</h1>")
+    "text/plain",
+    "502 Bad Gateway")
 
 proc nowDateTime: (string, string) =
   var ti = now()
@@ -317,7 +317,9 @@ proc handler(fd: AsyncFD, ip: string) {.async.} =
           await callback(request, response)
         except:
           # erro check.
-          asyncCheck response.mofuwSend(badGateway())
+          let fut = response.mofuwSend(badGateway())
+          fut.callback = proc() =
+            closeSocket(response.fd)
           break handler
 
         # for pipeline ?
@@ -338,7 +340,9 @@ proc handler(fd: AsyncFD, ip: string) {.async.} =
               await callback(request, response)
             except:
               # erro check.
-              asyncCheck response.mofuwSend(badGateway())
+              let fut = response.mofuwSend(badGateway())
+              fut.callback = proc() =
+                closeSocket(response.fd)
               break handler
             remainingBufferSize = request.buf.len - request.bodyStart - 1
           else:
